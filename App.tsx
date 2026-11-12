@@ -858,6 +858,70 @@ export default function App() {
     }
   }, [bookingsHistory]);
 
+  // Restore the pending booking when Poketo redirects the buyer back to the storefront.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('poketo') !== 'return') return;
+    const bookingRef = params.get('bookingRef');
+    if (!bookingRef) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem('asri_travel_bookings_v2') || '[]');
+      const booking = saved.find((item) => item.bookingRef === bookingRef);
+      if (booking) {
+        setActiveBooking(booking);
+        setView('payment');
+      }
+    } catch (error) {
+      console.error('Unable to restore Poketo return booking', error);
+    }
+    window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+  }, []);
+
+  // Poll server-owned order status after redirect; only a verified webhook can make it PAID.
+  useEffect(() => {
+    if (view !== 'payment' || !activeBooking || activeBooking.status !== 'PENDING') return;
+    const env = (import.meta as any).env || {};
+    const supabaseUrl = env.VITE_SUPABASE_URL;
+    const publishableKey = env.VITE_SUPABASE_PUBLISHABLE_KEY;
+    if (!supabaseUrl || !publishableKey) return;
+    let cancelled = false;
+    const checkStatus = async () => {
+      try {
+        const response = await fetch(`${supabaseUrl.replace(/\/$/, '')}/functions/v1/poketo-order-status`, {
+          method: 'POST',
+          headers: { apikey: publishableKey, Authorization: `Bearer ${publishableKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bookingRef: activeBooking.bookingRef, email: activeBooking.contactEmail }),
+        });
+        if (!response.ok) return;
+        const result = await response.json();
+        if (cancelled || !result.status || result.status === 'PENDING') return;
+        const updated = {
+          ...activeBooking,
+          status: result.status,
+          paidAt: result.paidAt || null,
+          travelStatus: result.status === 'PAID' ? 'TERJADWAL' : result.status,
+        };
+        setActiveBooking(updated);
+        setBookingsHistory((prev) => prev.map((item) => item.bookingRef === updated.bookingRef ? updated : item));
+        if (result.status === 'PAID') {
+          setView('confirmation');
+          showToast('Pembayaran berhasil diverifikasi oleh Poketo.', 'success');
+        } else {
+          showToast(`Status pembayaran: ${result.status}`, 'error');
+        }
+      } catch (error) {
+        console.error('Poketo order status check failed', error);
+      }
+    };
+    checkStatus();
+    const interval = setInterval(checkStatus, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [view, activeBooking?.bookingRef, activeBooking?.status, activeBooking?.contactEmail]);
+
+
   // Payment countdown timer (15 minutes = 900 seconds)
   const [paymentSecondsLeft, setPaymentSecondsLeft] = useState(900);
   const [isCreatingPoketoInvoice, setIsCreatingPoketoInvoice] = useState(false);
@@ -1074,8 +1138,7 @@ export default function App() {
       return;
     }
 
-    const randomDigits = Math.floor(10000 + Math.random() * 90000);
-    const bookingRef = `ASRI-${randomDigits}`;
+    const bookingRef = `ASRI-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
     
 
     const newBooking = {
