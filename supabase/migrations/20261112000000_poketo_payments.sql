@@ -47,7 +47,7 @@ create or replace function public.process_asriva_poketo_event(
 )
 returns jsonb
 language plpgsql
-security definer
+security invoker
 set search_path = public, pg_temp
 as $$
 declare
