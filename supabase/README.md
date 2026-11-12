@@ -29,9 +29,9 @@ The browser needs only the public values in the root `.env.example`:
 
 ## Deploy and configure
 
-1. Link the correct Supabase project.
-2. Apply the migration.
-3. Set the three Edge Function secrets above.
+1. Link Supabase project `xbjvvsuyrryibyrjehko` (`chiken`, region `ap-southeast-1`).
+2. Apply the migration (already applied to that project in this deployment).
+3. Set the three Edge Function secrets above in Supabase Dashboard → Project Settings → Edge Functions → Secrets (do not paste secrets into GitHub or chat).
 4. Deploy all three functions. Their JWT verification is disabled because the webhook authenticates with Poketo HMAC and guest checkout/status are public endpoints; use additional abuse controls before a live launch.
 5. Configure the Poketo dashboard webhook URL as `https://<project-ref>.supabase.co/functions/v1/poketo-webhook`.
 6. Keep the Poketo key in sandbox until the fare is calculated from trusted server-side inventory.
