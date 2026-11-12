@@ -228,8 +228,11 @@ Deno.serve(async (req) => {
     });
     const lookupBody = await lookupResponse.json().catch(() => ({}));
     let invoice: JsonObject | null = null;
+    let responseStatus = 200;
+    let reused = false;
 
     if (lookupResponse.ok && isObject(lookupBody.data)) {
+      reused = true;
       invoice = lookupBody.data;
     } else if (!(lookupResponse.status === 404 && lookupBody.error?.code === "not_found")) {
       return json({ error: lookupBody.error ?? { code: "poketo_lookup_failed", message: "Unable to reconcile invoice by referenceId." } }, lookupResponse.status >= 400 ? lookupResponse.status : 502);
@@ -255,6 +258,8 @@ Deno.serve(async (req) => {
         return json({ error: { code, message } }, createResponse.status >= 400 ? createResponse.status : 502);
       }
       invoice = createBody.data;
+      responseStatus = createResponse.status;
+      reused = createResponse.status === 200;
     }
 
     if (!invoice.id || invoice.referenceId !== referenceId || !["pending", "paid", "expired", "cancelled", "refunded"].includes(String(invoice.status))) {
@@ -266,7 +271,7 @@ Deno.serve(async (req) => {
       .eq("environment", environment).eq("reference_id", referenceId);
     if (updateError) throw updateError;
 
-    return json({ data: invoice, reused: Boolean(lookupResponse.ok) }, lookupResponse.ok ? 200 : 201);
+    return json({ data: invoice, reused }, responseStatus);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unexpected backend error";
     console.error("poketo-create-invoice", message);
