@@ -847,43 +847,7 @@ export default function App() {
     } catch (e) {
       console.error(e);
     }
-    // Seed 1 sample booking so users can also test My Booking immediately if desired
-    return [
-      {
-        bookingRef: 'ASRI-88421',
-        createdAt: '2026-11-10T10:15:00Z',
-        status: 'PAID',
-        travelStatus: 'TERJADWAL',
-        paymentMethod: 'Virtual Account BCA',
-        paymentRef: '880192837465',
-        trip: BASE_TRIPS[0],
-        searchCriteria: {
-          category: 'flight',
-          originId: 'CGK',
-          destId: 'DPS',
-          departureDate: getTomorrowDateStr(),
-          passengers: 1,
-        },
-        passengers: [
-          {
-            fullName: 'Budi Santoso',
-            title: 'Tuan',
-            idType: 'KTP',
-            idNumber: '3174091208900004',
-            passengerType: 'Dewasa',
-            seatNumber: '12A',
-          },
-        ],
-        contactEmail: 'budi.santoso@contoh.id',
-        contactPhone: '081234567890',
-        pricing: {
-          baseTotal: 1180000,
-          serviceFee: 25000,
-          discount: 0,
-          grandTotal: 1205000,
-        },
-      },
-    ];
+    return [];
   });
 
   useEffect(() => {
@@ -894,8 +858,73 @@ export default function App() {
     }
   }, [bookingsHistory]);
 
+  // Restore the pending booking when Poketo redirects the buyer back to the storefront.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('poketo') !== 'return') return;
+    const bookingRef = params.get('bookingRef');
+    if (!bookingRef) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem('asri_travel_bookings_v2') || '[]');
+      const booking = saved.find((item) => item.bookingRef === bookingRef);
+      if (booking) {
+        setActiveBooking(booking);
+        setView('payment');
+      }
+    } catch (error) {
+      console.error('Unable to restore Poketo return booking', error);
+    }
+    window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+  }, []);
+
+  // Poll server-owned order status after redirect; only a verified webhook can make it PAID.
+  useEffect(() => {
+    if (view !== 'payment' || !activeBooking || activeBooking.status !== 'PENDING') return;
+    const env = (import.meta as any).env || {};
+    const supabaseUrl = env.VITE_SUPABASE_URL;
+    const publishableKey = env.VITE_SUPABASE_PUBLISHABLE_KEY;
+    if (!supabaseUrl || !publishableKey) return;
+    let cancelled = false;
+    const checkStatus = async () => {
+      try {
+        const response = await fetch(`${supabaseUrl.replace(/\/$/, '')}/functions/v1/poketo-order-status`, {
+          method: 'POST',
+          headers: { apikey: publishableKey, Authorization: `Bearer ${publishableKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bookingRef: activeBooking.bookingRef, email: activeBooking.contactEmail }),
+        });
+        if (!response.ok) return;
+        const result = await response.json();
+        if (cancelled || !result.status || result.status === 'PENDING') return;
+        const updated = {
+          ...activeBooking,
+          status: result.status,
+          paidAt: result.paidAt || null,
+          travelStatus: result.status === 'PAID' ? 'TERJADWAL' : result.status,
+        };
+        setActiveBooking(updated);
+        setBookingsHistory((prev) => prev.map((item) => item.bookingRef === updated.bookingRef ? updated : item));
+        if (result.status === 'PAID') {
+          setView('confirmation');
+          showToast('Pembayaran berhasil diverifikasi oleh Poketo.', 'success');
+        } else {
+          showToast(`Status pembayaran: ${result.status}`, 'error');
+        }
+      } catch (error) {
+        console.error('Poketo order status check failed', error);
+      }
+    };
+    checkStatus();
+    const interval = setInterval(checkStatus, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [view, activeBooking?.bookingRef, activeBooking?.status, activeBooking?.contactEmail]);
+
+
   // Payment countdown timer (15 minutes = 900 seconds)
   const [paymentSecondsLeft, setPaymentSecondsLeft] = useState(900);
+  const [isCreatingPoketoInvoice, setIsCreatingPoketoInvoice] = useState(false);
 
   useEffect(() => {
     if (view !== 'payment' || !activeBooking || activeBooking.status !== 'PENDING') return;
@@ -1109,9 +1138,8 @@ export default function App() {
       return;
     }
 
-    const randomDigits = Math.floor(10000 + Math.random() * 90000);
-    const bookingRef = `ASRI-${randomDigits}`;
-    const paymentRef = `VA8801${Math.floor(10000000 + Math.random() * 90000000)}`;
+    const bookingRef = `ASRI-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
+    
 
     const newBooking = {
       bookingRef,
@@ -1119,7 +1147,6 @@ export default function App() {
       status: 'PENDING',
       travelStatus: 'MENUNGGU PEMBAYARAN',
       paymentMethod: selectedPaymentMethod,
-      paymentRef,
       trip: selectedTrip,
       searchCriteria: { ...searchCriteria },
       passengers: passengersData.map((p, i) => ({
@@ -1137,46 +1164,52 @@ export default function App() {
     navigateTo('payment');
   };
 
-  // Simulate Payment Result
-  const handleSimulatePayment = (outcome) => {
-    if (!activeBooking) return;
-    const methodNames = {
-      va: 'Virtual Account BCA / Mandiri',
-      qris: 'QRIS Instan',
-      transfer: 'Transfer Bank Manual',
-      ewallet: 'E-Wallet (GoPay / OVO / DANA)',
-    };
-
-    if (outcome === 'SUCCESS') {
-      const updated = {
-        ...activeBooking,
-        status: 'PAID',
-        travelStatus: 'TERJADWAL',
-        paidAt: new Date().toISOString(),
-        paymentMethodLabel: methodNames[selectedPaymentMethod] || 'Virtual Account',
-      };
+    // Create or reuse a Poketo sandbox invoice. The browser never marks an order paid.
+  const handleCreatePoketoInvoice = async () => {
+    if (!activeBooking || isCreatingPoketoInvoice) return;
+    setIsCreatingPoketoInvoice(true);
+    try {
+      const env = (import.meta as any).env || {};
+      const supabaseUrl = env.VITE_SUPABASE_URL;
+      const publishableKey = env.VITE_SUPABASE_PUBLISHABLE_KEY;
+      if (!supabaseUrl || !publishableKey) throw new Error('Konfigurasi Supabase frontend belum tersedia.');
+      const origin = getCityInfo(activeBooking.trip.category, activeBooking.trip.originId);
+      const destination = getCityInfo(activeBooking.trip.category, activeBooking.trip.destId);
+      const response = await fetch(`${supabaseUrl.replace(/\/$/, '')}/functions/v1/poketo-create-invoice`, {
+        method: 'POST',
+        headers: { apikey: publishableKey, Authorization: `Bearer ${publishableKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          bookingRef: activeBooking.bookingRef,
+          amount: Math.round(activeBooking.pricing.grandTotal),
+          customer: {
+            name: activeBooking.passengers?.[0]?.fullName || 'Pelanggan ASRIVA',
+            email: activeBooking.contactEmail,
+            phone: activeBooking.contactPhone,
+          },
+          orderData: {
+            tripId: activeBooking.trip.id,
+            operator: activeBooking.trip.operator,
+            origin: origin.city,
+            destination: destination.city,
+            departureDate: activeBooking.searchCriteria.departureDate,
+            passengerCount: activeBooking.passengers.length,
+          },
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.paymentUrl) throw new Error(result.message || result.error || 'Gagal membuat invoice Poketo.');
+      const updated = { ...activeBooking, paymentUrl: result.paymentUrl, poketoInvoiceId: result.invoiceId };
       setActiveBooking(updated);
-      setBookingsHistory((prev) =>
-        prev.map((b) => (b.bookingRef === updated.bookingRef ? updated : b))
-      );
-      showToast('Simulasi pembayaran berhasil! E-Tiket Anda telah terbit.', 'success');
-      navigateTo('confirmation');
-    } else {
-      const updated = {
-        ...activeBooking,
-        status: 'FAILED',
-        travelStatus: 'PEMBAYARAN GAGAL',
-      };
-      setActiveBooking(updated);
-      setBookingsHistory((prev) =>
-        prev.map((b) => (b.bookingRef === updated.bookingRef ? updated : b))
-      );
-      showToast('Simulasi pembayaran gagal. Silakan coba kembali atau ganti metode.', 'error');
+      setBookingsHistory((prev) => prev.map((booking) => booking.bookingRef === updated.bookingRef ? updated : booking));
+      window.location.assign(result.paymentUrl);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Gagal menghubungi layanan pembayaran.', 'error');
+    } finally {
+      setIsCreatingPoketoInvoice(false);
     }
   };
 
-  // ==========================================================================
-  // 5. SUB-VIEWS / PAGES
+    // 5. SUB-VIEWS / PAGES
   // ==========================================================================
 
   // -------------------- HEADER & NAVIGATION --------------------
@@ -2839,166 +2872,47 @@ export default function App() {
     );
   };
 
-  // -------------------- PAGE F: MOCK PAYMENT --------------------
+  // -------------------- PAGE F: POKETO PAYMENT --------------------
   const renderMockPaymentPage = () => {
     if (!activeBooking) return null;
-
-    const mins = String(Math.floor(paymentSecondsLeft / 60)).padStart(2, '0');
-    const secs = String(paymentSecondsLeft % 60).padStart(2, '0');
-
-    const methods = [
-      { id: 'va', name: 'Virtual Account', desc: 'BCA, Mandiri, BNI, BRI (Verifikasi Otomatis)', icon: Building2 },
-      { id: 'qris', name: 'QRIS Instan', desc: 'Scan QR dengan aplikasi bank atau e-wallet apa saja', icon: QrCode },
-      { id: 'transfer', name: 'Transfer Bank', desc: 'Transfer antar bank ke rekening resmi ASRI TRAVEL', icon: CreditCard },
-      { id: 'ewallet', name: 'E-Wallet', desc: 'GoPay, OVO, DANA, ShopeePay', icon: Wallet },
-    ];
-
+    const total = activeBooking.pricing?.grandTotal ?? 0;
+    const hasInvoice = Boolean(activeBooking.paymentUrl);
     return (
       <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* DEMO / SIMULATED PAYMENT BANNER */}
         <div className="mb-6 p-4 rounded-2xl bg-amber-50 border border-amber-300 flex items-start gap-3">
           <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
           <div className="text-xs sm:text-sm text-amber-900">
-            <strong className="uppercase tracking-wider block font-extrabold">
-              MODE SIMULASI / DEMO PEMBAYARAN
-            </strong>
-            <span>
-              Halaman ini adalah simulasi sistem pembayaran untuk keperluan prototipe. Tidak ada dana nyata yang dipotong atau ditransfer.
-            </span>
+            <strong className="uppercase tracking-wider block font-extrabold">Poketo Sandbox</strong>
+            <span>Pembayaran ini menggunakan lingkungan uji coba. Tidak ada dana nyata yang dipindahkan.</span>
           </div>
         </div>
-
-        {/* Status & Countdown Header */}
-        <div className="bg-[#101B35] text-white rounded-2xl p-6 mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div className="bg-[#101B35] text-white rounded-2xl p-6 mb-6">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <span className="text-xs font-bold uppercase tracking-wider text-slate-300">Kode Booking: {activeBooking.bookingRef}</span>
+            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-extrabold bg-amber-400/20 text-[#FF9B50] border border-amber-400/40">STATUS: {activeBooking.status}</span>
+          </div>
+          <h1 className="text-2xl sm:text-3xl font-extrabold mt-2">{formatIDR(total)}</h1>
+          <p className="text-xs text-slate-300 mt-1">Biaya metode pembayaran Poketo dapat ditampilkan saat checkout.</p>
+        </div>
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-5">
           <div>
-            <div className="flex items-center gap-2.5">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
-                Kode Booking: {activeBooking.bookingRef}
-              </span>
-              <span
-                className={`px-2.5 py-0.5 rounded-full text-[11px] font-extrabold ${
-                  activeBooking.status === 'FAILED'
-                    ? 'bg-red-500/20 text-red-300 border border-red-400/40'
-                    : 'bg-amber-400/20 text-[#FF9B50] border border-amber-400/40'
-                }`}
-              >
-                STATUS: {activeBooking.status}
-              </span>
-            </div>
-            <h1 className="text-2xl sm:text-3xl font-extrabold mt-1">
-              {formatIDR(activeBooking.pricing.grandTotal)}
-            </h1>
+            <h2 className="text-base font-extrabold text-[#101B35]">Pembayaran melalui Poketo</h2>
+            <p className="text-sm text-[#788196] mt-1">Lanjutkan ke halaman Poketo untuk memilih QRIS, Virtual Account, PayLater, atau kartu debit yang tersedia.</p>
           </div>
-
-          <div className="bg-white/10 px-4 py-3 rounded-xl text-center">
-            <span className="text-[11px] uppercase tracking-wider text-slate-300 block">
-              Batas Waktu Simulasi
-            </span>
-            <span className="font-mono text-xl font-extrabold text-[#FF9B50]">
-              {mins}:{secs}
-            </span>
+          {activeBooking.status === 'PAID' ? (
+            <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-sm text-emerald-800 font-semibold">Pembayaran telah dikonfirmasi oleh webhook Poketo.</div>
+          ) : (
+            <button onClick={handleCreatePoketoInvoice} disabled={isCreatingPoketoInvoice}
+              className="w-full py-3.5 px-4 rounded-xl bg-[#315EF6] hover:bg-blue-700 disabled:opacity-60 text-white font-bold text-sm shadow-md transition-colors">
+              {isCreatingPoketoInvoice ? 'Menyiapkan invoice…' : hasInvoice ? 'Lanjutkan pembayaran di Poketo' : 'Buat invoice & bayar dengan Poketo'}
+            </button>
+          )}
+          <div className="text-xs text-[#788196] bg-slate-50 p-4 rounded-xl space-y-1">
+            <p className="font-bold text-[#172033]">Konfirmasi pembayaran</p>
+            <p>Status pesanan hanya berubah menjadi PAID setelah server menerima dan memverifikasi webhook invoice.paid dari Poketo.</p>
+            <p>Halaman redirect dan status checkout tidak digunakan sebagai bukti pembayaran.</p>
           </div>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-          {/* Payment Method Selector */}
-          <div className="md:col-span-6 space-y-3">
-            <h2 className="text-base font-extrabold text-[#101B35] mb-2">
-              1. Pilih Metode Pembayaran
-            </h2>
-            {methods.map((m) => {
-              const Icon = m.icon;
-              const active = selectedPaymentMethod === m.id;
-              return (
-                <button
-                  key={m.id}
-                  onClick={() => setSelectedPaymentMethod(m.id)}
-                  className={`w-full p-4 rounded-2xl border text-left flex items-center gap-3.5 transition-all ${
-                    active
-                      ? 'bg-white border-[#315EF6] ring-2 ring-blue-100 shadow-sm'
-                      : 'bg-white border-slate-200 hover:border-slate-300'
-                  }`}
-                >
-                  <div
-                    className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
-                      active ? 'bg-[#315EF6] text-white' : 'bg-[#F7F8FC] text-[#101B35]'
-                    }`}
-                  >
-                    <Icon className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <h3 className="text-sm font-extrabold text-[#101B35]">{m.name}</h3>
-                    <p className="text-xs text-[#788196]">{m.desc}</p>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Payment Instruction & Simulation Controls */}
-          <div className="md:col-span-6">
-            <h2 className="text-base font-extrabold text-[#101B35] mb-2">
-              2. Instruksi Pembayaran (DEMO)
-            </h2>
-            <div className="bg-white rounded-2xl border border-slate-200/90 p-6 space-y-5">
-              <div>
-                <span className="text-xs font-bold uppercase tracking-wider text-[#788196]">
-                  Referensi Pembayaran Simulasi
-                </span>
-                <div className="mt-1.5 p-3.5 rounded-xl bg-[#F7F8FC] border border-slate-200 flex items-center justify-between">
-                  <span className="font-mono text-base font-extrabold text-[#101B35]">
-                    {activeBooking.paymentRef}
-                  </span>
-                  <button
-                    onClick={() => {
-                      navigator.clipboard?.writeText(activeBooking.paymentRef);
-                      showToast('Nomor referensi simulasi disalin!', 'success');
-                    }}
-                    className="inline-flex items-center gap-1 text-xs font-bold text-[#315EF6]"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Salin</span>
-                  </button>
-                </div>
-              </div>
-
-              {selectedPaymentMethod === 'qris' && (
-                <div className="text-center py-2">
-                  <DeterministicQRCode value={`QRIS-${activeBooking.bookingRef}`} size={136} />
-                  <p className="text-xs text-[#788196] mt-2">
-                    QRIS Simulasi • PT Asri Travel Nusantara
-                  </p>
-                </div>
-              )}
-
-              <div className="text-xs text-[#788196] space-y-1.5 bg-slate-50 p-3.5 rounded-xl">
-                <p className="font-bold text-[#172033]">Petunjuk Simulasi:</p>
-                <p>1. Pastikan nominal pembayaran sesuai dengan total tagihan.</p>
-                <p>2. Klik tombol simulasi di bawah untuk menguji skenario pembayaran berhasil atau gagal.</p>
-              </div>
-
-              {activeBooking.status === 'FAILED' && (
-                <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
-                  Simulasi pembayaran sebelumnya ditandai GAGAL. Anda dapat menekan "Simulasikan Pembayaran Berhasil" untuk mencoba lagi.
-                </div>
-              )}
-
-              <div className="pt-2 space-y-2.5">
-                <button
-                  onClick={() => handleSimulatePayment('SUCCESS')}
-                  className="w-full py-3.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm shadow-md transition-colors cursor-pointer"
-                >
-                  Simulasikan Pembayaran Berhasil
-                </button>
-                <button
-                  onClick={() => handleSimulatePayment('FAILED')}
-                  className="w-full py-3 px-4 rounded-xl bg-white hover:bg-red-50 text-red-600 border border-red-200 font-bold text-xs transition-colors cursor-pointer"
-                >
-                  Simulasikan Pembayaran Gagal
-                </button>
-              </div>
-            </div>
-          </div>
+          <button onClick={() => navigateTo('my-booking')} className="text-sm font-bold text-[#315EF6] hover:underline">Kembali ke cek pesanan</button>
         </div>
       </div>
     );
@@ -3018,7 +2932,7 @@ export default function App() {
           </div>
 
           <span className="inline-block px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-extrabold uppercase tracking-wider">
-            PAID (SIMULATED) • PEMBAYARAN TERKONFIRMASI
+            PEMBAYARAN TERKONFIRMASI VIA POKETO
           </span>
 
           <h1 className="text-2xl sm:text-3xl font-extrabold text-[#101B35] mt-3">

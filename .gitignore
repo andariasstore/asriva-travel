@@ -1,0 +1,12 @@
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+supabase/functions/.env
+supabase/functions/.env.*
+!.env.example
+
+# Dependencies / build output
+node_modules/
+dist/
+.DS_Store

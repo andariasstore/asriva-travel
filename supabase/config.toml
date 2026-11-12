@@ -1,0 +1,10 @@
+project_id = "asriva-travel"
+
+[functions.poketo-create-invoice]
+verify_jwt = false
+
+[functions.poketo-webhook]
+verify_jwt = false
+
+[functions.poketo-order-status]
+verify_jwt = false
