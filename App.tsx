@@ -1222,6 +1222,7 @@ export default function App() {
             email: contactEmail.trim().toLowerCase(),
             phone: contactPhone.trim(),
           },
+          redirectUrl: window.location.protocol === 'https:' ? window.location.origin : undefined,
           metadata: {
             bookingRef,
             category: selectedTrip.category,
@@ -1252,7 +1253,11 @@ export default function App() {
 
       setActiveBooking(bookingWithInvoice);
       setBookingsHistory((prev) => [newBooking, ...prev.filter((item) => item.bookingRef !== bookingRef)]);
-      sessionStorage.setItem('asri_active_booking_v1', JSON.stringify(bookingWithInvoice));
+      try {
+        sessionStorage.setItem('asri_active_booking_v1', JSON.stringify(bookingWithInvoice));
+      } catch (storageError) {
+        console.warn('Unable to persist guest payment session.', storageError);
+      }
       navigateTo('payment');
 
       if (!paymentUrl || !/^https:\/\//i.test(paymentUrl)) {
