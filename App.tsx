@@ -8,6 +8,10 @@ import {
   Sparkles, Compass, Star, Car, Armchair, Briefcase, Award, RefreshCw
 } from 'lucide-react';
 
+const SUPABASE_FUNCTIONS_BASE = 'https://xbjvvsuyrryibyrjehko.supabase.co/functions/v1';
+const POKETO_CREATE_INVOICE_URL = `${SUPABASE_FUNCTIONS_BASE}/poketo-create-invoice`;
+const POKETO_ORDER_STATUS_URL = `${SUPABASE_FUNCTIONS_BASE}/poketo-order-status`;
+
 // ============================================================================
 // 1. DATA ARCHITECTURE & MOCK INVENTORY (INDONESIA MARKET - BAHASA INDONESIA)
 // ============================================================================
@@ -840,6 +844,9 @@ export default function App() {
   // Payment & Completed Bookings State
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('va'); // va, qris, transfer, ewallet
   const [activeBooking, setActiveBooking] = useState(null);
+  const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
+  const [paymentError, setPaymentError] = useState('');
+  const [isCheckingInvoice, setIsCheckingInvoice] = useState(false);
   const [bookingsHistory, setBookingsHistory] = useState(() => {
     try {
       const saved = localStorage.getItem('asri_travel_bookings_v2');
@@ -894,16 +901,81 @@ export default function App() {
     }
   }, [bookingsHistory]);
 
-  // Payment countdown timer (15 minutes = 900 seconds)
-  const [paymentSecondsLeft, setPaymentSecondsLeft] = useState(900);
+  useEffect(() => {
+    try {
+      const saved = sessionStorage.getItem('asri_active_booking_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed?.bookingRef && parsed?.guestAccessToken) {
+          setActiveBooking(parsed);
+          setView('payment');
+        }
+      }
+    } catch (error) {
+      console.warn('Unable to restore guest payment session.', error);
+    }
+  }, []);
 
   useEffect(() => {
-    if (view !== 'payment' || !activeBooking || activeBooking.status !== 'PENDING') return;
-    const interval = setInterval(() => {
-      setPaymentSecondsLeft((prev) => (prev > 0 ? prev - 1 : 0));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [view, activeBooking]);
+    if (!activeBooking?.guestAccessToken || activeBooking.status !== 'PENDING') return;
+    let stopped = false;
+    let inFlight = false;
+
+    const poll = async () => {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const response = await fetch(POKETO_ORDER_STATUS_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bookingRef: activeBooking.bookingRef,
+            email: activeBooking.contactEmail,
+            guestAccessToken: activeBooking.guestAccessToken,
+          }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result?.error?.message || result?.error || 'Status invoice belum dapat diperiksa.');
+        if (stopped) return;
+        const normalized = String(result.status || '').toLowerCase();
+        if (normalized === 'paid' || normalized === 'expired' || normalized === 'cancelled' || normalized === 'refunded') {
+          const mapped = {
+            paid: { status: 'PAID', travelStatus: 'TERJADWAL' },
+            expired: { status: 'EXPIRED', travelStatus: 'INVOICE KEDALUWARSA' },
+            cancelled: { status: 'CANCELLED', travelStatus: 'PEMBAYARAN DIBATALKAN' },
+            refunded: { status: 'REFUNDED', travelStatus: 'DANA DIKEMBALIKAN' },
+          }[normalized];
+          const updated = { ...activeBooking, ...mapped, invoiceStatus: normalized, paidAt: result.paidAt || null };
+          setActiveBooking(updated);
+          setBookingsHistory((prev) => prev.map((booking) => booking.bookingRef === updated.bookingRef
+            ? { ...booking, ...mapped, invoiceStatus: normalized }
+            : booking));
+          if (normalized === 'paid') {
+            sessionStorage.removeItem('asri_active_booking_v1');
+            setView('confirmation');
+            showToast('Pembayaran terkonfirmasi oleh Poketo.', 'success');
+          } else {
+            sessionStorage.setItem('asri_active_booking_v1', JSON.stringify(updated));
+          }
+        } else {
+          setActiveBooking((current) => current?.bookingRef === activeBooking.bookingRef
+            ? { ...current, invoiceStatus: normalized || 'pending' }
+            : current);
+        }
+      } catch (error) {
+        if (!stopped) console.warn('Poketo invoice status polling failed.', error);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    poll();
+    const timer = window.setInterval(poll, 5000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [activeBooking?.bookingRef, activeBooking?.guestAccessToken, activeBooking?.contactEmail, activeBooking?.status]);
 
   // Scroll to top smoothly on view change
   const navigateTo = (targetView) => {
@@ -1102,76 +1174,164 @@ export default function App() {
     showToast(`Promo ${found.code} berhasil diterapkan!`, 'success');
   };
 
-  // Create Booking & Move to Mock Payment
-  const handleCreatePendingBooking = () => {
+  // Create a guest booking and request a real Poketo invoice.
+  const handleCreatePendingBooking = async () => {
     if (!termsAccepted) {
       showToast('Anda harus menyetujui Syarat & Ketentuan pemesanan.', 'error');
       return;
     }
+    if (!selectedTrip || !contactEmail.trim()) {
+      showToast('Data perjalanan dan email pemesan wajib tersedia.', 'error');
+      return;
+    }
+    if (isCreatingInvoice) return;
 
+    setIsCreatingInvoice(true);
+    setPaymentError('');
     const randomDigits = Math.floor(10000 + Math.random() * 90000);
     const bookingRef = `ASRI-${randomDigits}`;
-    const paymentRef = `VA8801${Math.floor(10000000 + Math.random() * 90000000)}`;
-
     const newBooking = {
       bookingRef,
       createdAt: new Date().toISOString(),
       status: 'PENDING',
       travelStatus: 'MENUNGGU PEMBAYARAN',
-      paymentMethod: selectedPaymentMethod,
-      paymentRef,
+      paymentMethod: 'Poketo',
+      paymentRef: bookingRef,
       trip: selectedTrip,
       searchCriteria: { ...searchCriteria },
       passengers: passengersData.map((p, i) => ({
         ...p,
         seatNumber: p.seatPreference || `${11 + i}A`,
       })),
-      contactEmail,
+      contactEmail: contactEmail.trim().toLowerCase(),
       contactPhone,
       pricing: { ...pricingSummary },
     };
 
-    setActiveBooking(newBooking);
-    setPaymentSecondsLeft(900);
-    setBookingsHistory((prev) => [newBooking, ...prev]);
-    navigateTo('payment');
+    try {
+      const response = await fetch(POKETO_CREATE_INVOICE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          referenceId: bookingRef,
+          amount: Math.round(pricingSummary.grandTotal),
+          title: `Pembayaran tiket ASRI TRAVEL ${bookingRef}`,
+          description: `${selectedTrip.operator} • ${selectedTrip.serviceCode} • ${formatDateIndo(searchCriteria.departureDate)}`,
+          customer: {
+            name: passengersData[0]?.fullName || 'Pelanggan ASRI TRAVEL',
+            email: contactEmail.trim().toLowerCase(),
+            phone: contactPhone.trim(),
+          },
+          metadata: {
+            bookingRef,
+            category: selectedTrip.category,
+            serviceCode: selectedTrip.serviceCode,
+            departureDate: searchCriteria.departureDate,
+            passengerCount: passengersData.length,
+          },
+        }),
+      });
+
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result?.data) {
+        throw new Error(result?.error?.message || result?.error?.code || 'Gagal membuat invoice pembayaran.');
+      }
+      if (typeof result.guestAccessToken !== 'string' || !/^[a-f0-9]{64}$/i.test(result.guestAccessToken)) {
+        throw new Error('Token akses tamu tidak valid dari backend pembayaran.');
+      }
+
+      const invoice = result.data;
+      const paymentUrl = typeof invoice.paymentUrl === 'string' ? invoice.paymentUrl : '';
+      const bookingWithInvoice = {
+        ...newBooking,
+        invoiceId: invoice.id,
+        invoiceStatus: invoice.status || 'pending',
+        paymentUrl,
+        guestAccessToken: result.guestAccessToken,
+      };
+
+      setActiveBooking(bookingWithInvoice);
+      setBookingsHistory((prev) => [newBooking, ...prev.filter((item) => item.bookingRef !== bookingRef)]);
+      sessionStorage.setItem('asri_active_booking_v1', JSON.stringify(bookingWithInvoice));
+      navigateTo('payment');
+
+      if (!paymentUrl || !/^https:\/\//i.test(paymentUrl)) {
+        setPaymentError('Invoice berhasil dibuat, tetapi URL pembayaran tidak tersedia. Periksa status invoice sebelum mencoba membuat invoice baru.');
+        return;
+      }
+
+      window.location.assign(paymentUrl);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Terjadi kesalahan saat membuat invoice.';
+      setPaymentError(message);
+      showToast(message, 'error');
+    } finally {
+      setIsCreatingInvoice(false);
+    }
   };
 
-  // Simulate Payment Result
-  const handleSimulatePayment = (outcome) => {
-    if (!activeBooking) return;
-    const methodNames = {
-      va: 'Virtual Account BCA / Mandiri',
-      qris: 'QRIS Instan',
-      transfer: 'Transfer Bank Manual',
-      ewallet: 'E-Wallet (GoPay / OVO / DANA)',
+  // Apply a verified invoice status returned by the guest status endpoint.
+  const applyInvoiceStatus = (result) => {
+    if (!result || typeof result.status !== 'string' || !activeBooking) return;
+    const normalizedStatus = result.status.toLowerCase();
+    const statusMap = {
+      paid: { status: 'PAID', travelStatus: 'TERJADWAL' },
+      expired: { status: 'EXPIRED', travelStatus: 'INVOICE KEDALUWARSA' },
+      cancelled: { status: 'CANCELLED', travelStatus: 'PEMBAYARAN DIBATALKAN' },
+      refunded: { status: 'REFUNDED', travelStatus: 'DANA DIKEMBALIKAN' },
     };
+    const mapped = statusMap[normalizedStatus];
+    if (!mapped) return;
 
-    if (outcome === 'SUCCESS') {
-      const updated = {
-        ...activeBooking,
-        status: 'PAID',
-        travelStatus: 'TERJADWAL',
-        paidAt: new Date().toISOString(),
-        paymentMethodLabel: methodNames[selectedPaymentMethod] || 'Virtual Account',
-      };
-      setActiveBooking(updated);
-      setBookingsHistory((prev) =>
-        prev.map((b) => (b.bookingRef === updated.bookingRef ? updated : b))
-      );
-      showToast('Simulasi pembayaran berhasil! E-Tiket Anda telah terbit.', 'success');
-      navigateTo('confirmation');
-    } else {
-      const updated = {
-        ...activeBooking,
-        status: 'FAILED',
-        travelStatus: 'PEMBAYARAN GAGAL',
-      };
-      setActiveBooking(updated);
-      setBookingsHistory((prev) =>
-        prev.map((b) => (b.bookingRef === updated.bookingRef ? updated : b))
-      );
-      showToast('Simulasi pembayaran gagal. Silakan coba kembali atau ganti metode.', 'error');
+    const updated = {
+      ...activeBooking,
+      ...mapped,
+      invoiceStatus: normalizedStatus,
+      paidAt: result.paidAt || activeBooking.paidAt || null,
+    };
+    setActiveBooking(updated);
+    setBookingsHistory((prev) =>
+      prev.map((booking) => booking.bookingRef === updated.bookingRef
+        ? { ...booking, ...mapped, invoiceStatus: normalizedStatus }
+        : booking)
+    );
+    try {
+      if (normalizedStatus === 'paid') {
+        sessionStorage.removeItem('asri_active_booking_v1');
+        navigateTo('confirmation');
+        showToast('Pembayaran terkonfirmasi oleh Poketo.', 'success');
+      } else {
+        sessionStorage.setItem('asri_active_booking_v1', JSON.stringify(updated));
+      }
+    } catch (storageError) {
+      console.warn('Unable to update session booking cache.', storageError);
+    }
+  };
+
+  const checkInvoiceStatus = async () => {
+    if (!activeBooking?.guestAccessToken || !activeBooking?.bookingRef || !activeBooking?.contactEmail) return;
+    setIsCheckingInvoice(true);
+    try {
+      const response = await fetch(POKETO_ORDER_STATUS_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          bookingRef: activeBooking.bookingRef,
+          email: activeBooking.contactEmail,
+          guestAccessToken: activeBooking.guestAccessToken,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(result?.error?.message || result?.error || 'Tidak dapat memeriksa status invoice.');
+      }
+      applyInvoiceStatus(result);
+      setPaymentError('');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Gagal memeriksa status pembayaran.';
+      setPaymentError(message);
+    } finally {
+      setIsCheckingInvoice(false);
     }
   };
 
@@ -2839,163 +2999,100 @@ export default function App() {
     );
   };
 
-  // -------------------- PAGE F: MOCK PAYMENT --------------------
+  // -------------------- PAGE F: POKETO PAYMENT --------------------
   const renderMockPaymentPage = () => {
     if (!activeBooking) return null;
-
-    const mins = String(Math.floor(paymentSecondsLeft / 60)).padStart(2, '0');
-    const secs = String(paymentSecondsLeft % 60).padStart(2, '0');
-
-    const methods = [
-      { id: 'va', name: 'Virtual Account', desc: 'BCA, Mandiri, BNI, BRI (Verifikasi Otomatis)', icon: Building2 },
-      { id: 'qris', name: 'QRIS Instan', desc: 'Scan QR dengan aplikasi bank atau e-wallet apa saja', icon: QrCode },
-      { id: 'transfer', name: 'Transfer Bank', desc: 'Transfer antar bank ke rekening resmi ASRI TRAVEL', icon: CreditCard },
-      { id: 'ewallet', name: 'E-Wallet', desc: 'GoPay, OVO, DANA, ShopeePay', icon: Wallet },
-    ];
+    const invoiceStatus = String(activeBooking.invoiceStatus || 'pending').toUpperCase();
+    const isFinal = ['PAID', 'EXPIRED', 'CANCELLED', 'REFUNDED'].includes(activeBooking.status);
 
     return (
       <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* DEMO / SIMULATED PAYMENT BANNER */}
-        <div className="mb-6 p-4 rounded-2xl bg-amber-50 border border-amber-300 flex items-start gap-3">
-          <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-          <div className="text-xs sm:text-sm text-amber-900">
-            <strong className="uppercase tracking-wider block font-extrabold">
-              MODE SIMULASI / DEMO PEMBAYARAN
-            </strong>
-            <span>
-              Halaman ini adalah simulasi sistem pembayaran untuk keperluan prototipe. Tidak ada dana nyata yang dipotong atau ditransfer.
-            </span>
-          </div>
-        </div>
-
-        {/* Status & Countdown Header */}
         <div className="bg-[#101B35] text-white rounded-2xl p-6 mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
-            <div className="flex items-center gap-2.5">
+            <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
                 Kode Booking: {activeBooking.bookingRef}
               </span>
-              <span
-                className={`px-2.5 py-0.5 rounded-full text-[11px] font-extrabold ${
-                  activeBooking.status === 'FAILED'
-                    ? 'bg-red-500/20 text-red-300 border border-red-400/40'
-                    : 'bg-amber-400/20 text-[#FF9B50] border border-amber-400/40'
-                }`}
-              >
-                STATUS: {activeBooking.status}
+              <span className="px-2.5 py-0.5 rounded-full bg-amber-400/20 text-[#FF9B50] border border-amber-400/40 text-[11px] font-extrabold">
+                {activeBooking.status}
               </span>
             </div>
             <h1 className="text-2xl sm:text-3xl font-extrabold mt-1">
               {formatIDR(activeBooking.pricing.grandTotal)}
             </h1>
+            <p className="text-xs text-slate-300 mt-1">Status invoice Poketo: {invoiceStatus}</p>
           </div>
-
           <div className="bg-white/10 px-4 py-3 rounded-xl text-center">
-            <span className="text-[11px] uppercase tracking-wider text-slate-300 block">
-              Batas Waktu Simulasi
-            </span>
-            <span className="font-mono text-xl font-extrabold text-[#FF9B50]">
-              {mins}:{secs}
-            </span>
+            <span className="text-[11px] uppercase tracking-wider text-slate-300 block">Pemeriksaan Otomatis</span>
+            <span className="font-bold text-[#FF9B50] text-sm">Setiap 5 detik</span>
           </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-          {/* Payment Method Selector */}
-          <div className="md:col-span-6 space-y-3">
-            <h2 className="text-base font-extrabold text-[#101B35] mb-2">
-              1. Pilih Metode Pembayaran
-            </h2>
-            {methods.map((m) => {
-              const Icon = m.icon;
-              const active = selectedPaymentMethod === m.id;
-              return (
-                <button
-                  key={m.id}
-                  onClick={() => setSelectedPaymentMethod(m.id)}
-                  className={`w-full p-4 rounded-2xl border text-left flex items-center gap-3.5 transition-all ${
-                    active
-                      ? 'bg-white border-[#315EF6] ring-2 ring-blue-100 shadow-sm'
-                      : 'bg-white border-slate-200 hover:border-slate-300'
-                  }`}
-                >
-                  <div
-                    className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
-                      active ? 'bg-[#315EF6] text-white' : 'bg-[#F7F8FC] text-[#101B35]'
-                    }`}
-                  >
-                    <Icon className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <h3 className="text-sm font-extrabold text-[#101B35]">{m.name}</h3>
-                    <p className="text-xs text-[#788196]">{m.desc}</p>
-                  </div>
-                </button>
-              );
-            })}
+          <div className="md:col-span-7 bg-white rounded-2xl border border-slate-200 p-6 space-y-4">
+            <div>
+              <h2 className="text-base font-extrabold text-[#101B35]">Selesaikan Pembayaran</h2>
+              <p className="text-sm text-[#788196] mt-1">
+                Anda akan diarahkan ke halaman pembayaran resmi Poketo. Status pembayaran akan diverifikasi melalui backend.
+              </p>
+            </div>
+
+            {paymentError && (
+              <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-semibold">
+                {paymentError}
+              </div>
+            )}
+
+            {activeBooking.status === 'PENDING' && activeBooking.paymentUrl && (
+              <button
+                onClick={() => window.location.assign(activeBooking.paymentUrl)}
+                className="w-full py-3.5 px-4 rounded-xl bg-[#315EF6] hover:bg-blue-700 text-white font-bold text-sm"
+              >
+                Lanjutkan ke Pembayaran Poketo
+              </button>
+            )}
+
+            <button
+              onClick={checkInvoiceStatus}
+              disabled={isCheckingInvoice}
+              className="w-full py-3 px-4 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-[#101B35] font-bold text-sm disabled:opacity-60"
+            >
+              {isCheckingInvoice ? 'Memeriksa status...' : 'Periksa Status Pembayaran'}
+            </button>
+
+            {activeBooking.status === 'PAID' && (
+              <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 text-sm text-emerald-800 font-semibold">
+                Pembayaran telah dikonfirmasi. E-Tiket dapat dibuka dari halaman konfirmasi.
+              </div>
+            )}
+            {['EXPIRED', 'CANCELLED', 'REFUNDED'].includes(activeBooking.status) && (
+              <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800 font-semibold">
+                Invoice berstatus {activeBooking.status}. Hubungi layanan pelanggan jika Anda memerlukan bantuan.
+              </div>
+            )}
+            <p className="text-[11px] text-[#788196]">
+              Jangan membuat invoice baru untuk kode booking ini. Backend menggunakan referenceId untuk mencegah invoice ganda.
+            </p>
           </div>
 
-          {/* Payment Instruction & Simulation Controls */}
-          <div className="md:col-span-6">
-            <h2 className="text-base font-extrabold text-[#101B35] mb-2">
-              2. Instruksi Pembayaran (DEMO)
-            </h2>
-            <div className="bg-white rounded-2xl border border-slate-200/90 p-6 space-y-5">
-              <div>
-                <span className="text-xs font-bold uppercase tracking-wider text-[#788196]">
-                  Referensi Pembayaran Simulasi
-                </span>
-                <div className="mt-1.5 p-3.5 rounded-xl bg-[#F7F8FC] border border-slate-200 flex items-center justify-between">
-                  <span className="font-mono text-base font-extrabold text-[#101B35]">
-                    {activeBooking.paymentRef}
-                  </span>
-                  <button
-                    onClick={() => {
-                      navigator.clipboard?.writeText(activeBooking.paymentRef);
-                      showToast('Nomor referensi simulasi disalin!', 'success');
-                    }}
-                    className="inline-flex items-center gap-1 text-xs font-bold text-[#315EF6]"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Salin</span>
-                  </button>
-                </div>
+          <div className="md:col-span-5 bg-white rounded-2xl border border-slate-200 p-6">
+            <h2 className="text-base font-extrabold text-[#101B35] mb-4">Ringkasan Booking</h2>
+            <div className="space-y-3 text-sm">
+              <div className="flex justify-between gap-3">
+                <span className="text-[#788196]">Referensi</span>
+                <strong className="text-right">{activeBooking.bookingRef}</strong>
               </div>
-
-              {selectedPaymentMethod === 'qris' && (
-                <div className="text-center py-2">
-                  <DeterministicQRCode value={`QRIS-${activeBooking.bookingRef}`} size={136} />
-                  <p className="text-xs text-[#788196] mt-2">
-                    QRIS Simulasi • PT Asri Travel Nusantara
-                  </p>
-                </div>
-              )}
-
-              <div className="text-xs text-[#788196] space-y-1.5 bg-slate-50 p-3.5 rounded-xl">
-                <p className="font-bold text-[#172033]">Petunjuk Simulasi:</p>
-                <p>1. Pastikan nominal pembayaran sesuai dengan total tagihan.</p>
-                <p>2. Klik tombol simulasi di bawah untuk menguji skenario pembayaran berhasil atau gagal.</p>
+              <div className="flex justify-between gap-3">
+                <span className="text-[#788196]">Pemesan</span>
+                <strong className="text-right break-all">{activeBooking.contactEmail}</strong>
               </div>
-
-              {activeBooking.status === 'FAILED' && (
-                <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-700 font-medium">
-                  Simulasi pembayaran sebelumnya ditandai GAGAL. Anda dapat menekan "Simulasikan Pembayaran Berhasil" untuk mencoba lagi.
-                </div>
-              )}
-
-              <div className="pt-2 space-y-2.5">
-                <button
-                  onClick={() => handleSimulatePayment('SUCCESS')}
-                  className="w-full py-3.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm shadow-md transition-colors cursor-pointer"
-                >
-                  Simulasikan Pembayaran Berhasil
-                </button>
-                <button
-                  onClick={() => handleSimulatePayment('FAILED')}
-                  className="w-full py-3 px-4 rounded-xl bg-white hover:bg-red-50 text-red-600 border border-red-200 font-bold text-xs transition-colors cursor-pointer"
-                >
-                  Simulasikan Pembayaran Gagal
-                </button>
+              <div className="flex justify-between gap-3">
+                <span className="text-[#788196]">Invoice</span>
+                <strong className="text-right break-all">{activeBooking.invoiceId || '-'}</strong>
+              </div>
+              <div className="pt-3 border-t border-slate-100 flex justify-between gap-3">
+                <span className="font-extrabold">Total</span>
+                <strong className="text-[#315EF6]">{formatIDR(activeBooking.pricing.grandTotal)}</strong>
               </div>
             </div>
           </div>
@@ -3018,14 +3115,14 @@ export default function App() {
           </div>
 
           <span className="inline-block px-3 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-extrabold uppercase tracking-wider">
-            PAID (SIMULATED) • PEMBAYARAN TERKONFIRMASI
+            PEMBAYARAN TERKONFIRMASI • POKETO
           </span>
 
           <h1 className="text-2xl sm:text-3xl font-extrabold text-[#101B35] mt-3">
             Pemesanan Tiket Berhasil!
           </h1>
           <p className="text-sm text-[#788196] mt-1.5 max-w-lg mx-auto">
-            Terima kasih telah memesan bersama ASRI TRAVEL. E-Tiket digital Anda telah diterbitkan dan siap digunakan.
+            Terima kasih telah memesan bersama ASRI TRAVEL. Pembayaran Anda telah dikonfirmasi.
           </p>
 
           {/* Booking Reference Box */}
