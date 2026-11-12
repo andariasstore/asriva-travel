@@ -2989,6 +2989,10 @@ export default function App() {
                 </span>
               </label>
 
+              <div className="mb-4 p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900">
+                <strong className="block mb-1">Catatan integrasi</strong>
+                Jadwal dan tarif saat ini masih berasal dari data demo di aplikasi. Gunakan hanya Poketo sandbox sampai inventaris, ketersediaan kursi, dan total tagihan divalidasi oleh backend.
+              </div>
               <button
                 onClick={handleCreatePendingBooking}
                 disabled={isCreatingInvoice}
