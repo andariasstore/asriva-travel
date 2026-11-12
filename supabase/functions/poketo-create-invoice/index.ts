@@ -164,6 +164,15 @@ Deno.serve(async (req) => {
   }
   const environment = poketoKey.startsWith("sk_test_") ? "sandbox" : "live";
   const db = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } });
+  const authorization = req.headers.get("Authorization") ?? "";
+  const accessToken = authorization.match(/^Bearer\\s+(.+)$/i)?.[1];
+  if (!accessToken) {
+    return json({ error: { code: "unauthorized", message: "A valid Supabase access token is required." } }, 401);
+  }
+  const { data: authData, error: authError } = await db.auth.getUser(accessToken);
+  if (authError || !authData.user) {
+    return json({ error: { code: "unauthorized", message: "Invalid Supabase access token." } }, 401);
+  }
 
   try {
     let { data: local, error: lookupError } = await db.from("invoices")
