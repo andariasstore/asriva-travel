@@ -589,7 +589,7 @@ const FAQS = [
   },
   {
     q: 'Apakah transaksi pembayaran di aplikasi ini bersifat nyata?',
-    a: 'Aplikasi ini merupakan prototipe etalase pemesanan tiket interaktif. Seluruh metode pembayaran (Virtual Account, QRIS, Transfer Bank, E-Wallet) berjalan dalam mode simulasi/demo tanpa memotong saldo nyata.'
+    a: 'Pembayaran dibuat sebagai invoice melalui Poketo. Setelah pembayaran, status diverifikasi kembali dari backend sebelum pesanan ditandai lunas.'
   },
   {
     q: 'Bisakah saya memesan tiket untuk beberapa penumpang sekaligus?',
@@ -842,7 +842,6 @@ export default function App() {
   const [termsAccepted, setTermsAccepted] = useState(false);
 
   // Payment & Completed Bookings State
-  const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('va'); // va, qris, transfer, ewallet
   const [activeBooking, setActiveBooking] = useState(null);
   const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
   const [paymentError, setPaymentError] = useState('');
@@ -1188,8 +1187,7 @@ export default function App() {
 
     setIsCreatingInvoice(true);
     setPaymentError('');
-    const randomDigits = Math.floor(10000 + Math.random() * 90000);
-    const bookingRef = `ASRI-${randomDigits}`;
+    const bookingRef = `ASRI-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
     const newBooking = {
       bookingRef,
       createdAt: new Date().toISOString(),
@@ -2993,9 +2991,10 @@ export default function App() {
 
               <button
                 onClick={handleCreatePendingBooking}
-                className="w-full py-4 px-5 rounded-xl bg-[#315EF6] hover:bg-blue-700 text-white font-bold text-sm shadow-lg shadow-blue-600/20 transition-all cursor-pointer"
+                disabled={isCreatingInvoice}
+                className="w-full py-4 px-5 rounded-xl bg-[#315EF6] hover:bg-blue-700 text-white font-bold text-sm shadow-lg shadow-blue-600/20 transition-all cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                Lanjut ke Pembayaran
+                {isCreatingInvoice ? 'Membuat Invoice...' : 'Lanjut ke Pembayaran'}
               </button>
             </div>
           </div>
@@ -3008,8 +3007,6 @@ export default function App() {
   const renderMockPaymentPage = () => {
     if (!activeBooking) return null;
     const invoiceStatus = String(activeBooking.invoiceStatus || 'pending').toUpperCase();
-    const isFinal = ['PAID', 'EXPIRED', 'CANCELLED', 'REFUNDED'].includes(activeBooking.status);
-
     return (
       <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <div className="bg-[#101B35] text-white rounded-2xl p-6 mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
